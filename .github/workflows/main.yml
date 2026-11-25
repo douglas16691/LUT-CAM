@@ -1,1 +1,399 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'__END_OF_FILE__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.lutcamera"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.lutcamera"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.activity:activity-ktx:1.9.0")
+              implementation("androidx.camera:camera-core:1.3.4")
+              implementation("androidx.camera:camera-camera2:1.3.4")
+              implementation("androidx.camera:camera-lifecycle:1.3.4")
+          }
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-feature android:name="android.hardware.camera" android:required="true" />
+              <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+              <application
+                  android:label="LUT Camera"
+                  android:allowBackup="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/java/com/example/lutcamera/LutRenderer.kt')"
+          cat > 'app/src/main/java/com/example/lutcamera/LutRenderer.kt' <<'__END_OF_FILE__'
+          package com.example.lutcamera
 
+          import android.graphics.Bitmap
+          import android.graphics.Matrix
+          import android.graphics.SurfaceTexture
+          import android.opengl.GLES11Ext
+          import android.opengl.GLES20
+          import android.opengl.GLSurfaceView
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import java.util.concurrent.atomic.AtomicBoolean
+          import javax.microedition.khronos.egl.EGLConfig
+          import javax.microedition.khronos.opengles.GL10
+          import kotlin.math.PI
+          import kotlin.math.cos
+          import kotlin.math.sin
+
+          /** Draws the camera stream through a 3D LUT shader and can render a full-resolution grabbed frame. */
+          class LutRenderer(
+              private val view: GLSurfaceView,
+              private val onTexture: (SurfaceTexture) -> Unit
+          ) : GLSurfaceView.Renderer {
+
+              @Volatile var amount = 1f
+              @Volatile var rotation = 0      // degrees, from CameraX TransformationInfo
+              @Volatile var bufW = 0
+              @Volatile var bufH = 0
+              @Volatile private var pendingLut: Lut? = null
+              @Volatile private var currentLut: Lut? = null
+              @Volatile private var captureCb: ((Bitmap) -> Unit)? = null
+
+              private val newFrame = AtomicBoolean(false)
+              private var gotFrame = false
+              private var st: SurfaceTexture? = null
+              private var prog = 0
+              private var camTex = 0
+              private var lutTex = 0
+              private var lutN = 33f
+              private var vw = 1
+              private var vh = 1
+              private val texMat = FloatArray(16).also { android.opengl.Matrix.setIdentityM(it, 0) }
+              private val quad = ByteBuffer.allocateDirect(64).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+                  put(floatArrayOf(-1f, -1f, 0f, 0f, 1f, -1f, 1f, 0f, -1f, 1f, 0f, 1f, 1f, 1f, 1f, 1f)); position(0)
+              }
+
+              fun setLut(l: Lut) { currentLut = l; pendingLut = l; view.requestRender() }
+              fun capture(cb: (Bitmap) -> Unit) { captureCb = cb; view.requestRender() }
+
+              override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+                  prog = link(VS, FS)
+                  val t = IntArray(2)
+                  GLES20.glGenTextures(2, t, 0)
+                  camTex = t[0]; lutTex = t[1]
+                  GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, camTex)
+                  params(GLES11Ext.GL_TEXTURE_EXTERNAL_OES)
+                  GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTex)
+                  params(GLES20.GL_TEXTURE_2D)
+                  pendingLut = currentLut
+                  gotFrame = false
+                  st?.release()
+                  val s = SurfaceTexture(camTex)
+                  s.setOnFrameAvailableListener { newFrame.set(true); view.requestRender() }
+                  st = s
+                  view.post { onTexture(s) }
+              }
+
+              override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) { vw = width; vh = height }
+
+              override fun onDrawFrame(gl: GL10?) {
+                  GLES20.glClearColor(0f, 0f, 0f, 1f)
+                  GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                  val s = st ?: return
+                  pendingLut?.let { upload(it); pendingLut = null }
+                  if (newFrame.getAndSet(false)) { s.updateTexImage(); s.getTransformMatrix(texMat); gotFrame = true }
+                  if (!gotFrame || bufW == 0 || lutN < 2f) return
+
+                  val swap = rotation % 180 != 0
+                  val cw = if (swap) bufH else bufW
+                  val ch = if (swap) bufW else bufH
+                  val ca = cw.toFloat() / ch
+                  val va = vw.toFloat() / vh
+                  var sx = 1f; var sy = 1f
+                  if (ca > va) sx = ca / va else sy = va / ca   // "cover" fit
+                  GLES20.glViewport(0, 0, vw, vh)
+                  draw(sx, sy)
+
+                  captureCb?.let { captureCb = null; it(readFrame(cw, ch)) }
+              }
+
+              private fun upload(l: Lut) {
+                  GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+                  GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTex)
+                  l.data.position(0)
+                  GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, l.n * l.n, l.n, 0,
+                      GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, l.data)
+                  lutN = l.n.toFloat()
+              }
+
+              private fun draw(sx: Float, sy: Float) {
+                  GLES20.glUseProgram(prog)
+                  val a = rotation * PI.toFloat() / 180f
+                  val c = cos(a); val s = sin(a)
+                  GLES20.glUniform2f(u("uScale"), sx, sy)
+                  GLES20.glUniformMatrix4fv(u("uTexMat"), 1, false, texMat, 0)
+                  GLES20.glUniformMatrix2fv(u("uRot"), 1, false, floatArrayOf(c, s, -s, c), 0)
+                  GLES20.glUniform1f(u("uN"), lutN)
+                  GLES20.glUniform1f(u("uAmt"), amount)
+                  GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                  GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, camTex)
+                  GLES20.glUniform1i(u("uCam"), 0)
+                  GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+                  GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTex)
+                  GLES20.glUniform1i(u("uLut"), 1)
+                  val aPos = GLES20.glGetAttribLocation(prog, "aPos")
+                  val aTex = GLES20.glGetAttribLocation(prog, "aTex")
+                  quad.position(0); GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, quad)
+                  quad.position(2); GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 16, quad)
+                  GLES20.glEnableVertexAttribArray(aPos); GLES20.glEnableVertexAttribArray(aTex)
+                  GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+              }
+
+              /** Renders the current frame at the camera stream's own resolution into an FBO and reads it back. */
+              private fun readFrame(cw: Int, ch: Int): Bitmap {
+                  val tex = IntArray(1); val fbo = IntArray(1)
+                  GLES20.glGenTextures(1, tex, 0)
+                  GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
+                  GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, cw, ch, 0,
+                      GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+                  params(GLES20.GL_TEXTURE_2D)
+                  GLES20.glGenFramebuffers(1, fbo, 0)
+                  GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[0])
+                  GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+                      GLES20.GL_TEXTURE_2D, tex[0], 0)
+                  GLES20.glViewport(0, 0, cw, ch)
+                  draw(1f, 1f)
+                  val buf = ByteBuffer.allocateDirect(cw * ch * 4)
+                  GLES20.glReadPixels(0, 0, cw, ch, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf)
+                  GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                  GLES20.glDeleteFramebuffers(1, fbo, 0)
+                  GLES20.glDeleteTextures(1, tex, 0)
+                  val raw = Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888)
+                  raw.copyPixelsFromBuffer(buf)
+                  return Bitmap.createBitmap(raw, 0, 0, cw, ch, Matrix().apply { preScale(1f, -1f) }, false)
+              }
+
+              private fun u(name: String) = GLES20.glGetUniformLocation(prog, name)
+
+              private fun params(target: Int) {
+                  GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                  GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                  GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                  GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+              }
+
+              private fun link(vs: String, fs: String): Int {
+                  fun compile(type: Int, src: String): Int {
+                      val s = GLES20.glCreateShader(type)
+                      GLES20.glShaderSource(s, src); GLES20.glCompileShader(s)
+                      val ok = IntArray(1); GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, ok, 0)
+                      if (ok[0] == 0) throw RuntimeException(GLES20.glGetShaderInfoLog(s))
+                      return s
+                  }
+                  val p = GLES20.glCreateProgram()
+                  GLES20.glAttachShader(p, compile(GLES20.GL_VERTEX_SHADER, vs))
+                  GLES20.glAttachShader(p, compile(GLES20.GL_FRAGMENT_SHADER, fs))
+                  GLES20.glLinkProgram(p)
+                  return p
+              }
+
+              companion object {
+                  private const val VS = """
+                      attribute vec2 aPos; attribute vec2 aTex;
+                      uniform vec2 uScale; uniform mat4 uTexMat; uniform mat2 uRot;
+                      varying vec2 vUv;
+                      void main() {
+                          gl_Position = vec4(aPos * uScale, 0.0, 1.0);
+                          vec2 t = uRot * (aTex - 0.5) + 0.5;
+                          vUv = (uTexMat * vec4(t, 0.0, 1.0)).xy;
+                      }"""
+                  private const val FS = """
+                      #extension GL_OES_EGL_image_external : require
+                      precision highp float;
+                      varying vec2 vUv;
+                      uniform samplerExternalOES uCam;
+                      uniform sampler2D uLut;
+                      uniform float uN; uniform float uAmt;
+                      vec3 lutAt(vec3 c, float b) {
+                          vec2 t = vec2((b * uN + c.r * (uN - 1.0) + 0.5) / (uN * uN), (c.g * (uN - 1.0) + 0.5) / uN);
+                          return texture2D(uLut, t).rgb;
+                      }
+                      void main() {
+                          vec3 c = texture2D(uCam, vUv).rgb;
+                          float b = c.b * (uN - 1.0);
+                          float b0 = floor(b);
+                          float b1 = min(b0 + 1.0, uN - 1.0);
+                          vec3 o = mix(lutAt(c, b0), lutAt(c, b1), b - b0);
+                          gl_FragColor = vec4(mix(c, o, uAmt), 1.0);
+                      }"""
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/java/com/example/lutcamera/Luts.kt')"
+          cat > 'app/src/main/java/com/example/lutcamera/Luts.kt' <<'__END_OF_FILE__'
+          package com.example.lutcamera
+
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import kotlin.math.PI
+          import kotlin.math.sin
+
+          /** A 3D LUT stored as an (n*n) x n RGBA strip: texel x = r + b*n, y = g. */
+          class Lut(val n: Int, val data: ByteBuffer)
+
+          typealias Rgb = Triple<Float, Float, Float>
+
+          object Luts {
+              private fun lum(r: Float, g: Float, b: Float) = 0.2126f * r + 0.7152f * g + 0.0722f * b
+              private fun sat(r: Float, g: Float, b: Float, s: Float): Rgb {
+                  val y = lum(r, g, b)
+                  return Triple(y + (r - y) * s, y + (g - y) * s, y + (b - y) * s)
+              }
+              private fun curve(v: Float, k: Float) = (v - k * 0.16f * sin(v * 2f * PI.toFloat()))
+
+              val presets: Map<String, (Float, Float, Float) -> Rgb> = linkedMapOf(
+                  "Original" to { r, g, b -> Triple(r, g, b) },
+                  "Teal & Orange" to { r, g, b ->
+                      val y = lum(r, g, b); val (a, c, d) = sat(r, g, b, 1.15f)
+                      Triple(a + y * 0.14f - (1 - y) * 0.04f, c + 0.01f, d + (1 - y) * 0.16f - y * 0.10f)
+                  },
+                  "Film Fade" to { r, g, b ->
+                      val (a, c, d) = sat(r, g, b, 0.82f)
+                      Triple(a * 0.86f + 0.08f, c * 0.86f + 0.07f, d * 0.84f + 0.10f)
+                  },
+                  "Golden Hour" to { r, g, b -> Triple(r * 1.08f + 0.03f, g + 0.01f, b * 0.82f) },
+                  "Cool Blue" to { r, g, b -> Triple(r * 0.9f, g * 0.98f, b * 1.1f + 0.02f) },
+                  "Noir" to { r, g, b -> val y = curve(lum(r, g, b), 1.1f); Triple(y, y, y) },
+                  "Vivid" to { r, g, b ->
+                      val (a, c, d) = sat(r, g, b, 1.5f)
+                      Triple(curve(a, 0.7f), curve(c, 0.7f), curve(d, 0.7f))
+                  },
+                  "Bleach Bypass" to { r, g, b ->
+                      val y = lum(r, g, b); val (a, c, d) = sat(r, g, b, 0.45f); val k = 1.25f
+                      Triple((a - .5f) * k + .5f + (y - .5f) * .1f, (c - .5f) * k + .5f, (d - .5f) * k + .5f)
+                  }
+              )
+
+              private fun put(buf: ByteBuffer, r: Float, g: Float, b: Float) {
+                  buf.put((r.coerceIn(0f, 1f) * 255f).toInt().toByte())
+                  buf.put((g.coerceIn(0f, 1f) * 255f).toInt().toByte())
+                  buf.put((b.coerceIn(0f, 1f) * 255f).toInt().toByte())
+                  buf.put(255.toByte())
+              }
+
+              fun build(fn: (Float, Float, Float) -> Rgb, n: Int = 33): Lut {
+                  val buf = ByteBuffer.allocateDirect(n * n * n * 4).order(ByteOrder.nativeOrder())
+                  val m = (n - 1).toFloat()
+                  for (g in 0 until n) for (b in 0 until n) for (r in 0 until n) {
+                      val (or, og, ob) = fn(r / m, g / m, b / m)
+                      put(buf, or, og, ob)
+                  }
+                  buf.position(0)
+                  return Lut(n, buf)
+              }
+
+              /** Parses an Adobe/Resolve .cube 3D LUT (red varies fastest). */
+              fun parseCube(text: String): Lut {
+                  var n = 0
+                  val v = ArrayList<FloatArray>()
+                  for (line in text.lineSequence()) {
+                      val s = line.trim()
+                      if (s.isEmpty() || s.startsWith("#")) continue
+                      if (s.startsWith("LUT_3D_SIZE")) n = s.split(Regex("\\s+"))[1].toInt()
+                      else if (s[0].isDigit() || s[0] == '-' || s[0] == '.') {
+                          val p = s.split(Regex("\\s+"))
+                          if (p.size >= 3) v.add(floatArrayOf(p[0].toFloat(), p[1].toFloat(), p[2].toFloat()))
+                      }
+                  }
+                  require(n > 1 && v.size == n * n * n) { "Needs a 3D .cube file" }
+                  val buf = ByteBuffer.allocateDirect(n * n * n * 4).order(ByteOrder.nativeOrder())
+                  for (g in 0 until n) for (b in 0 until n) for (r in 0 until n) {
+                      val c = v[r + g * n + b * n * n]
+                      put(buf, c[0], c[1], c[2])
+                  }
+                  buf.position(0)
+                  return Lut(n, buf)
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/java/com/example/lutcamera/MainActivity.kt')"
+          cat > 'app/src/main/java/com/example/lutcamera/MainActivity.kt' <<'__END_OF_FILE__'
+          package com.example.lutcamera
+
+          import android.Manifest
+          import android.content.ContentValues
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.SurfaceTexture
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.opengl.GLSurfaceView
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.view.Surface
+          import android.view.View
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+          import android.widget.*
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.Preview
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.core.content.ContextCompat
+
+          class MainActivity : ComponentActivity() {
+              private val INK = 0xFF14110F.toInt(); private val PANEL = 0xFF1E1A17.toInt()
+              private val BONE = 0xFFECE6DA.toInt(); private val AMBER = 0xFFF0A640.toInt()
+              private val EDGE = 0xFF3A342E.toInt()
+
+              private lateinit var gl: GLSurfaceView
+              private lateinit var renderer: LutRenderer
+              private lateinit var strip: LinearLayout
+              private lateinit var lookLabel: TextView
+              private var surfaceTex: SurfaceTexture? = null
+       
